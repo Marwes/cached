@@ -6,6 +6,7 @@ Implementation of various caches
 use std::cmp::Eq;
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::marker::PhantomData;
 use std::time::Instant;
 
 use super::Cached;
@@ -235,18 +236,31 @@ impl<'a, T> Iterator for LRUListIterator<'a, T> {
     }
 }
 
+pub trait Size<K, V> {
+    fn size_of(&self, key: &K, value: &V) -> usize;
+}
+
+pub struct SizeCount<K, V>(PhantomData<fn(K, V)>);
+impl<K, V> Size<K, V> for SizeCount<K, V> {
+    fn size_of(&self, _key: &K, _value: &V) -> usize {
+        1
+    }
+}
+
 /// Least Recently Used / `Sized` Cache
 ///
 /// Stores up to a specified size before beginning
 /// to evict the least recently used keys
 ///
 /// Note: This cache is in-memory only
-pub struct SizedCache<K, V> {
+pub struct SizedCache<K, V, S = SizeCount<K, V>> {
     store: HashMap<K, usize>,
     order: LRUList<(K, V)>,
     capacity: usize,
     hits: u64,
     misses: u64,
+    size: usize,
+    sizer: S,
 }
 
 impl<K: Hash + Eq, V> SizedCache<K, V> {
@@ -257,6 +271,12 @@ impl<K: Hash + Eq, V> SizedCache<K, V> {
 
     /// Creates a new `SizedCache` with a given size limit and pre-allocated backing data
     pub fn with_size(size: usize) -> SizedCache<K, V> {
+        Self::with_custom_size(size, SizeCount(PhantomData))
+    }
+}
+
+impl<K: Hash + Eq, V, S: Size<K, V>> SizedCache<K, V, S> {
+    pub fn with_custom_size(size: usize, sizer: S) -> SizedCache<K, V, S> {
         if size == 0 {
             panic!("`size` of `SizedCache` must be greater than zero.")
         }
@@ -266,6 +286,8 @@ impl<K: Hash + Eq, V> SizedCache<K, V> {
             capacity: size,
             hits: 0,
             misses: 0,
+            size: 0,
+            sizer,
         }
     }
 
@@ -282,7 +304,7 @@ impl<K: Hash + Eq, V> SizedCache<K, V> {
     }
 }
 
-impl<K: Hash + Eq + Clone, V> Cached<K, V> for SizedCache<K, V> {
+impl<K: Hash + Eq + Clone, V, S: Size<K, V>> Cached<K, V> for SizedCache<K, V, S> {
     fn cache_get(&mut self, key: &K) -> Option<&V> {
         let val = self.store.get(key);
         match val {
@@ -314,14 +336,16 @@ impl<K: Hash + Eq + Clone, V> Cached<K, V> for SizedCache<K, V> {
     }
 
     fn cache_set(&mut self, key: K, val: V) {
-        if self.store.len() >= self.capacity {
+        while self.size >= self.capacity {
             // store has reached capacity, evict the oldest item.
             // store capacity cannot be zero, so there must be content in `self.order`.
-            let (key, _value) = self.order.pop_back();
+            let (key, value) = self.order.pop_back();
             self.store
                 .remove(&key)
                 .expect("SizedCache::cache_set failed evicting cache key");
+            self.size -= self.sizer.size_of(&key, &value);
         }
+        self.size += self.sizer.size_of(&key, &val);
         let Self { store, order, .. } = self;
         let index = *store
             .entry(key.clone())
